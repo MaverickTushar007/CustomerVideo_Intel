@@ -207,7 +207,7 @@ function ProcessingScreen({ jobId, onComplete }) {
       } catch (e) {}
     }, 1500);
     return () => clearInterval(interval);
-  }, [jobId]);
+  }, [jobId, onComplete]);
 
   const stages = [
     "Analysing video characteristics...",
