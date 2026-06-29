@@ -14,10 +14,11 @@ def load_models():
     if detector is None:
         detector = YOLO('yolo11n.pt')
 
-def process_video(job_id, video_path):
+def process_video(job_id, video_path, venue_id="default"):
     try:
         jobs[job_id] = {"status": "running", "progress": 0,
-                        "stage": "Loading models...", "result": None}
+                        "stage": "Loading models...", "result": None,
+                        "venue_id": venue_id}
         load_models()
 
         jobs[job_id]["stage"] = "Detecting people..."
@@ -92,6 +93,14 @@ def process_video(job_id, video_path):
         DB.close()
         os.remove(video_path)
 
+        # ── Self-learning: update venue memory from this run ──────────────
+        jobs[job_id]["stage"] = "Learning from this run..."
+        try:
+            from db.memory_updater import run_update
+            run_update(venue_id=venue_id)
+        except Exception as mem_err:
+            print(f"  [MEMORY] Warning: could not update venue memory: {mem_err}")
+
         jobs[job_id]["stage"] = "Complete"
         jobs[job_id]["progress"] = 100
         jobs[job_id]["status"] = "done"
@@ -100,10 +109,11 @@ def process_video(job_id, video_path):
         jobs[job_id]["status"] = "error"
         jobs[job_id]["stage"] = f"Error: {str(e)}"
 
-def start_job(video_path):
+def start_job(video_path, venue_id="default"):
     job_id = str(uuid.uuid4())[:8]
-    jobs[job_id] = {"status": "queued", "progress": 0, "stage": "Queued", "result": None}
-    t = threading.Thread(target=process_video, args=(job_id, video_path))
+    jobs[job_id] = {"status": "queued", "progress": 0, "stage": "Queued",
+                    "result": None, "venue_id": venue_id}
+    t = threading.Thread(target=process_video, args=(job_id, video_path, venue_id))
     t.daemon = True
     t.start()
     return job_id

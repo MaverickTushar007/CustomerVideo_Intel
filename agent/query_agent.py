@@ -31,12 +31,31 @@ Rules:
 - Always use SELECT, never INSERT/UPDATE/DELETE
 """
 
-def ask(question: str) -> dict:
+
+def ask(question: str, venue_id: str = "default") -> dict:
     db = sqlite3.connect('db/customer_intel.db')
+
+    # ── Inject venue memory context for self-learning awareness ───────────────
+    venue_context = ""
+    try:
+        from db.memory_updater import build_context_snapshot
+        venue_context = build_context_snapshot(venue_id=venue_id)
+    except Exception:
+        pass
+
+    system_with_context = SYSTEM
+    if venue_context:
+        system_with_context = (
+            SYSTEM
+            + "\n\nUse this learned venue context when formulating queries — "
+            + "it helps you give historically-aware answers:\n\n"
+            + venue_context
+        )
+
     msg = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": SYSTEM},
+            {"role": "system", "content": system_with_context},
             {"role": "user", "content": question}
         ],
         max_tokens=256,
@@ -55,6 +74,7 @@ def ask(question: str) -> dict:
     finally:
         db.close()
     return result
+
 
 if __name__ == "__main__":
     questions = [
@@ -76,6 +96,10 @@ if __name__ == "__main__":
         "How many customers were successfully served?",
         # Time ranges
         "What was the busiest 10-second window? Show the entry_time and count of people entering.",
+        # Self-learning / baseline questions
+        "How does today's performance compare to our typical patterns?",
+        "Are there any unusual patterns I should know about?",
+        "What's our busiest hour historically?",
     ]
     for q in questions:
         print(f"Q: {q}")

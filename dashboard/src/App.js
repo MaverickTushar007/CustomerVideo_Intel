@@ -286,10 +286,13 @@ function DashboardScreen({ onReset }) {
   const [persons, setPersons] = useState([]);
   const [hourly, setHourly] = useState([]);
   const [biq, setBiq] = useState(null);
+  const [baseline, setBaseline] = useState(null);
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState(null);
   const [loading, setLoading] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [ratings, setRatings] = useState({});
+  const venueId = "default";
 
   const fetchData = () => {
     axios.get(`${API}/metrics/summary`).then(r => {
@@ -299,6 +302,7 @@ function DashboardScreen({ onReset }) {
     axios.get(`${API}/metrics/persons`).then(r => setPersons(r.data)).catch(() => {});
     axios.get(`${API}/metrics/hourly`).then(r => setHourly(r.data)).catch(() => {});
     axios.get(`${API}/metrics/business_iq`).then(r => setBiq(r.data)).catch(() => {});
+    axios.get(`${API}/metrics/baseline?venue_id=${venueId}`).then(r => setBaseline(r.data)).catch(() => {});
   };
 
   useEffect(() => { fetchData(); }, []); // eslint-disable-line
@@ -310,7 +314,7 @@ function DashboardScreen({ onReset }) {
     setLoading(true);
     setAnswer(null);
     try {
-      const r = await axios.post(`${API}/ask`, { question: query });
+      const r = await axios.post(`${API}/ask?venue_id=${venueId}`, { question: query });
       setAnswer(r.data);
     } catch (e) {
       setAnswer({ plain_answer: "Could not reach the analytics engine." });
@@ -318,8 +322,17 @@ function DashboardScreen({ onReset }) {
     setLoading(false);
   };
 
+  const rateAnswer = async (answerId, rating) => {
+    if (!answerId) return;
+    setRatings(prev => ({ ...prev, [answerId]: rating }));
+    try {
+      await axios.post(`${API}/ask/${answerId}/rate`, { rating });
+    } catch (e) {}
+  };
+
   const chartData = persons.filter(p => p.dwell_seconds > 0);
   const maxDwell = Math.max(...chartData.map(d => d.dwell_seconds), 1);
+
 
   return (
     <div style={{ minHeight: "100vh", background: "#0a0f1a",
@@ -338,6 +351,16 @@ function DashboardScreen({ onReset }) {
           <p style={{ color: "#4b5563", fontSize: 13, margin: "6px 0 0" }}>
             AI-powered insights from your venue footage
           </p>
+          {baseline?.has_memory && (
+            <div style={{
+              display: "inline-flex", alignItems: "center", gap: 6,
+              background: "#052e16", border: "1px solid #166534",
+              borderRadius: 20, padding: "4px 12px", marginTop: 10,
+              fontSize: 12, color: "#4ade80", fontWeight: 600
+            }}>
+              🧠 Model has learned from {baseline.runs_recorded} run{baseline.runs_recorded !== 1 ? "s" : ""}
+            </div>
+          )}
         </div>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <span style={{ color: "#4b5563", fontSize: 12 }}>Updated {lastUpdated}</span>
@@ -424,6 +447,97 @@ function DashboardScreen({ onReset }) {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Baseline / Self-Learning Panel */}
+      {baseline && baseline.has_memory && (
+        <div style={{
+          background: "#0a1628", border: "1px solid #1e3a5f",
+          borderRadius: 16, padding: "24px 28px", marginBottom: 28
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between",
+            alignItems: "center", marginBottom: 18 }}>
+            <div>
+              <div style={{ color: "#60a5fa", fontSize: 11, fontWeight: 700,
+                textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                🧠 Venue Memory — Learned Baselines
+              </div>
+              <div style={{ color: "#9ca3af", fontSize: 12 }}>
+                {baseline.current_slot.day_of_week} {baseline.current_slot.hour}:00 UTC slot
+                · {baseline.runs_recorded} run{baseline.runs_recorded !== 1 ? "s" : ""} of data
+              </div>
+            </div>
+          </div>
+
+          {/* Anomaly alerts */}
+          {baseline.anomaly_flags && baseline.anomaly_flags.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              {baseline.anomaly_flags.map((flag, i) => (
+                <div key={i} style={{
+                  background: "#451a03", border: "1px solid #92400e",
+                  borderRadius: 10, padding: "10px 16px", marginBottom: 8,
+                  color: "#fbbf24", fontSize: 13, fontWeight: 500
+                }}>
+                  ⚠️ {flag}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Live vs baseline comparison */}
+          {baseline.live_today && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
+              {[
+                {
+                  label: "Visitors Today",
+                  live: baseline.live_today.visitors,
+                  baseline: baseline.baselines.find(b => b.metric_type === "visitor_count")?.value,
+                  format: v => Math.round(v),
+                  color: "#60a5fa"
+                },
+                {
+                  label: "Avg Dwell",
+                  live: baseline.live_today.avg_dwell_seconds,
+                  baseline: baseline.baselines.find(b => b.metric_type === "avg_dwell")?.value,
+                  format: v => v ? dwellLabel(v) : "—",
+                  color: "#a78bfa"
+                },
+                {
+                  label: "Abandonment",
+                  live: baseline.live_today.abandonment_rate_pct,
+                  baseline: baseline.baselines.find(b => b.metric_type === "abandonment_rate")?.value,
+                  format: v => v != null ? `${v}%` : "—",
+                  color: "#f87171"
+                },
+              ].map(({ label, live, baseline: base, format, color }) => (
+                <div key={label} style={{
+                  background: "#111827", borderRadius: 12,
+                  padding: "16px 18px", borderLeft: `3px solid ${color}`
+                }}>
+                  <div style={{ color: "#6b7280", fontSize: 11, fontWeight: 600,
+                    textTransform: "uppercase", letterSpacing: 1, marginBottom: 10 }}>
+                    {label}
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div>
+                      <div style={{ color: "#9ca3af", fontSize: 10, marginBottom: 2 }}>TODAY</div>
+                      <div style={{ color: color, fontSize: 22, fontWeight: 800 }}>
+                        {live != null ? format(live) : "—"}
+                      </div>
+                    </div>
+                    <div style={{ color: "#374151", fontSize: 20 }}>vs</div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ color: "#9ca3af", fontSize: 10, marginBottom: 2 }}>BASELINE</div>
+                      <div style={{ color: "#6b7280", fontSize: 22, fontWeight: 800 }}>
+                        {base != null ? format(base) : "No data yet"}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -580,7 +694,12 @@ function DashboardScreen({ onReset }) {
           Ask About Your Venue
         </div>
         <p style={{ color: "#4b5563", fontSize: 13, margin: "0 0 16px" }}>
-          Ask anything in plain English — powered by AI, no technical knowledge needed.
+          Ask anything in plain English — powered by AI with learned venue context.
+          {baseline?.has_memory && (
+            <span style={{ color: "#4ade80", marginLeft: 8 }}>
+              🧠 Answers are baseline-aware.
+            </span>
+          )}
         </p>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
           {PRESET_QUESTIONS.map(q => (
@@ -616,9 +735,55 @@ function DashboardScreen({ onReset }) {
             padding: "20px 24px", border: "1px solid #1f2937" }}>
             <div style={{ color: "#f59e0b", fontWeight: 700, fontSize: 13,
               marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Answer</div>
-            <div style={{ color: "#f9fafb", fontSize: 15, lineHeight: 1.8 }}>
+            <div style={{ color: "#f9fafb", fontSize: 15, lineHeight: 1.8, marginBottom: 16 }}>
               {answer.plain_answer}
             </div>
+
+            {/* Feedback buttons */}
+            {answer.answer_id && (
+              <div style={{ display: "flex", alignItems: "center", gap: 12,
+                borderTop: "1px solid #1f2937", paddingTop: 14 }}>
+                <span style={{ color: "#4b5563", fontSize: 12 }}>
+                  Was this helpful?
+                </span>
+                <button
+                  id="feedback-thumbs-up"
+                  onClick={() => rateAnswer(answer.answer_id, 1)}
+                  disabled={!!ratings[answer.answer_id]}
+                  style={{
+                    background: ratings[answer.answer_id] === 1 ? "#052e16" : "#1f2937",
+                    border: `1px solid ${ratings[answer.answer_id] === 1 ? "#166534" : "#374151"}`,
+                    color: ratings[answer.answer_id] === 1 ? "#4ade80" : "#9ca3af",
+                    borderRadius: 8, padding: "6px 14px", fontSize: 14,
+                    cursor: ratings[answer.answer_id] ? "default" : "pointer",
+                    transition: "all 0.2s"
+                  }}
+                >👍</button>
+                <button
+                  id="feedback-thumbs-down"
+                  onClick={() => rateAnswer(answer.answer_id, -1)}
+                  disabled={!!ratings[answer.answer_id]}
+                  style={{
+                    background: ratings[answer.answer_id] === -1 ? "#1c0a00" : "#1f2937",
+                    border: `1px solid ${ratings[answer.answer_id] === -1 ? "#7c2d12" : "#374151"}`,
+                    color: ratings[answer.answer_id] === -1 ? "#f97316" : "#9ca3af",
+                    borderRadius: 8, padding: "6px 14px", fontSize: 14,
+                    cursor: ratings[answer.answer_id] ? "default" : "pointer",
+                    transition: "all 0.2s"
+                  }}
+                >👎</button>
+                {ratings[answer.answer_id] === 1 && (
+                  <span style={{ color: "#4ade80", fontSize: 12 }}>
+                    ✓ Saved to venue memory — future answers will learn from this
+                  </span>
+                )}
+                {ratings[answer.answer_id] === -1 && (
+                  <span style={{ color: "#f97316", fontSize: 12 }}>
+                    ✗ Noted — this answer will be weighted down
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
