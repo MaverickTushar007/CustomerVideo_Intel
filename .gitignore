@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.so
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# YOLO / ML model weights (large binary files)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+
+# Video files (large media)
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Uploads and token crops (runtime artifacts)
+uploads/
+token_crops/
+
+# deep-person-reid (external dependency, large)
+deep-person-reid/
+
+# yolo_tracking (external dependency)
+yolo_tracking/
+
+# Environment secrets
+.env
+.env.*
+
+# Byte-compiled cache
+*.pyc

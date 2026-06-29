@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+groq
+python-multipart
+opencv-python-headless
+torch
+torchvision
+ultralytics
+torchreid
+numpy
+scipy
+Pillow
+yt-dlp
