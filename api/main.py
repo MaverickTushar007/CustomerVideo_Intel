@@ -6,6 +6,13 @@ import uuid
 from groq import Groq
 import os
 
+# Load .env file if present (for local development)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed; rely on env vars being set externally
+
 # Ensure DB exists on startup (Railway ephemeral filesystem)
 import os
 os.makedirs("db", exist_ok=True)
