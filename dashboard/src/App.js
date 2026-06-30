@@ -3,19 +3,6 @@ import axios from "axios";
 
 const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
 
-const PRESET_QUESTIONS = [
-  "How many visitors came today?",
-  "How many people were in the venue between 8pm and 9pm?",
-  "What was the average wait time this hour?",
-  "How many people left without being served today?",
-  "Which hour had the most visitors?",
-  "What was the busiest time period today?",
-  "Who stayed the longest and for how long?",
-  "How does the abandonment rate look today?",
-  "How many visitors came in the last 30 minutes?",
-  "What percentage of visitors were served today?",
-];
-
 
 
 function dwellLabel(s) {
