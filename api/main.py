@@ -21,25 +21,48 @@ os.makedirs("uploads", exist_ok=True)
 import sqlite3 as _sqlite3
 _conn = _sqlite3.connect("db/customer_intel.db")
 _conn.executescript("""
-CREATE TABLE IF NOT EXISTS persons (
-    token_id TEXT PRIMARY KEY,
-    first_seen TEXT NOT NULL,
-    last_seen TEXT,
-    camera_id TEXT,
-    abandoned INTEGER DEFAULT 0,
-    is_staff INTEGER DEFAULT 0,
-    staff_id TEXT
-);
-CREATE TABLE IF NOT EXISTS wait_metrics (
+PRAGMA foreign_keys = ON;
+
+-- 1. RAW OBSERVATIONS: every person bbox detected per frame
+CREATE TABLE IF NOT EXISTS raw_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    token_id TEXT,
-    entry_time TEXT,
-    exit_time TEXT,
-    wait_seconds REAL,
-    time_to_service REAL,
-    abandoned INTEGER DEFAULT 0,
-    date TEXT
+    timestamp TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    bbox_x1 REAL, bbox_y1 REAL,
+    bbox_x2 REAL, bbox_y2 REAL,
+    confidence REAL
 );
+
+-- 2. TEMPORAL SESSIONS: one row per tracker UUID lifecycle
+CREATE TABLE IF NOT EXISTS temporal_sessions (
+    session_id TEXT PRIMARY KEY,
+    camera_id TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT,
+    duration_seconds REAL
+);
+
+-- 3. STAFF RESOLUTIONS: semantic identity resolved independently per session
+CREATE TABLE IF NOT EXISTS staff_resolutions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES temporal_sessions(session_id) ON DELETE CASCADE,
+    staff_id TEXT,
+    confidence REAL,
+    resolution_method TEXT,
+    resolved_at TEXT
+);
+
+-- 4. BUSINESS EVENTS: derived events (service, abandonment, zone transitions)
+CREATE TABLE IF NOT EXISTS business_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT REFERENCES temporal_sessions(session_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    value REAL,
+    zone_id TEXT
+);
+
+-- 5. VENUE MEMORY: learned rolling baselines (isolated from raw observations)
 CREATE TABLE IF NOT EXISTS venue_memory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     venue_id TEXT DEFAULT 'default',
@@ -50,6 +73,8 @@ CREATE TABLE IF NOT EXISTS venue_memory (
     sample_count INTEGER DEFAULT 1,
     updated_at TEXT
 );
+
+-- 6. QUERY EXAMPLES: few-shot feedback loop
 CREATE TABLE IF NOT EXISTS query_examples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     venue_id TEXT DEFAULT 'default',
@@ -59,6 +84,10 @@ CREATE TABLE IF NOT EXISTS query_examples (
     rating INTEGER DEFAULT 0,
     created_at TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_sessions_start ON temporal_sessions(start_time);
+CREATE INDEX IF NOT EXISTS idx_biz_events_type ON business_events(event_type, timestamp);
+CREATE INDEX IF NOT EXISTS idx_raw_obs_time ON raw_observations(timestamp);
 """)
 _conn.commit()
 _conn.close()
@@ -71,23 +100,27 @@ def get_db():
 
 SCHEMA = """
 Tables:
-- persons(token_id TEXT, first_seen TEXT, last_seen TEXT, camera_id TEXT, abandoned INTEGER, is_staff INTEGER, staff_id TEXT)
-- wait_metrics(id INTEGER, token_id TEXT, entry_time TEXT, exit_time TEXT, wait_seconds REAL, time_to_service REAL, abandoned INTEGER, date TEXT)
+- temporal_sessions(session_id TEXT, camera_id TEXT, start_time TEXT, end_time TEXT, duration_seconds REAL)
+  One row per unique person tracked. session_id is a UUID, not a person name.
+- staff_resolutions(id INTEGER, session_id TEXT, staff_id TEXT, confidence REAL, resolution_method TEXT, resolved_at TEXT)
+  Semantic staff identity, decoupled from tracking. resolution_method: 'uniform_color', 'badge_contours', 'reid_embedding'.
+- business_events(id INTEGER, session_id TEXT, event_type TEXT, timestamp TEXT, value REAL, zone_id TEXT)
+  event_type values: 'wait_started', 'served', 'abandoned', 'zone_transition'.
+  value = wait time in seconds for 'served'/'abandoned' events.
+- venue_memory(id INTEGER, venue_id TEXT, metric_type TEXT, day_of_week INTEGER, hour_of_day INTEGER, value REAL, sample_count INTEGER)
 
 Notes:
-- abandoned=1 means left without being served
-- is_staff=1 means person is a staff member, is_staff=0 means customer
-- staff_id is the unique identifier of staff members (e.g. emp_mary, emp_jack)
-- wait_seconds is dwell time in SECONDS (not minutes)
-- time_to_service is the time in seconds from when the customer entered to when they were first attended/addressed by a staff member (null if not attended or if staff member)
-- The date column only exists in wait_metrics
-- entry_time and exit_time are ISO8601 UTC strings like 2026-06-27T08:30:10+00:00
-- To filter by today: WHERE date = date('now')
-- To filter by hour: WHERE strftime('%H', entry_time) = '20' (for 8pm UTC)
-- To filter a time range: WHERE entry_time BETWEEN '2026-06-27T08:00:00' AND '2026-06-27T09:00:00'
-- Always filter with wait_seconds > 3 to exclude false detections
-- To count visitors in last N minutes: WHERE entry_time >= datetime('now', '-N minutes')
-- Convert seconds to minutes by dividing by 60 when answering
+- Customers are sessions with NO matching staff_resolutions row (or confidence < 0.3).
+- Staff are sessions WITH a staff_resolutions row.
+- A 'served' event means a customer was attended by staff.
+- An 'abandoned' event means a customer left without being served.
+- value in business_events is dwell time in SECONDS for wait/service events — divide by 60 for minutes.
+- start_time, end_time, timestamp are ISO8601 UTC strings.
+- To filter to today: WHERE date(timestamp) = date('now')
+- To filter by hour: WHERE strftime('%H', timestamp) = '20'
+- Always exclude very short sessions: JOIN temporal_sessions ts ON be.session_id = ts.session_id WHERE ts.duration_seconds > 3
+- To find customer sessions only: LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id WHERE sr.id IS NULL
+- Never mention session_id or SQL in answers.
 """
 
 @app.get("/")
@@ -96,13 +129,20 @@ def root():
 
 @app.get("/metrics/summary")
 def summary():
+    """Summary KPIs from business_events + temporal_sessions (customers only)."""
     db = get_db()
     cur = db.cursor()
+    # Customer sessions = sessions with no resolved staff identity
     cur.execute("""
-        SELECT COUNT(*), ROUND(AVG(wait_seconds),1), ROUND(MAX(wait_seconds),1),
-               SUM(CASE WHEN abandoned=1 THEN 1 ELSE 0 END)
-        FROM wait_metrics
-        WHERE wait_seconds > 3
+        SELECT
+            COUNT(DISTINCT ts.session_id) as total,
+            ROUND(AVG(ts.duration_seconds), 1) as avg_dwell,
+            ROUND(MAX(ts.duration_seconds), 1) as max_dwell,
+            COUNT(DISTINCT CASE WHEN be.event_type = 'abandoned' THEN ts.session_id END) as abandoned
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
     """)
     r = cur.fetchone()
     db.close()
@@ -118,14 +158,19 @@ def summary():
 
 @app.get("/metrics/persons")
 def all_persons():
+    """Per-session visitor log from temporal_sessions + business_events."""
     db = get_db()
     cur = db.cursor()
     cur.execute("""
-        SELECT p.token_id, p.first_seen, p.camera_id, w.wait_seconds, w.abandoned
-        FROM persons p
-        LEFT JOIN wait_metrics w ON p.token_id = w.token_id
-        WHERE w.wait_seconds > 3
-        ORDER BY p.first_seen
+        SELECT
+            ts.session_id, ts.start_time, ts.camera_id, ts.duration_seconds,
+            MAX(CASE WHEN be.event_type = 'abandoned' THEN 1 ELSE 0 END) as abandoned
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
+        GROUP BY ts.session_id
+        ORDER BY ts.start_time
     """)
     rows = cur.fetchall()
     db.close()
@@ -134,13 +179,18 @@ def all_persons():
 
 @app.get("/metrics/longest_waits")
 def longest_waits(limit: int = 5):
+    """Top N longest customer sessions from temporal_sessions."""
     db = get_db()
     cur = db.cursor()
     cur.execute("""
-        SELECT token_id, wait_seconds, entry_time, abandoned
-        FROM wait_metrics
-        WHERE wait_seconds > 3
-        ORDER BY wait_seconds DESC LIMIT ?
+        SELECT ts.session_id, ts.duration_seconds, ts.start_time,
+               MAX(CASE WHEN be.event_type = 'abandoned' THEN 1 ELSE 0 END) as abandoned
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
+        GROUP BY ts.session_id
+        ORDER BY ts.duration_seconds DESC LIMIT ?
     """, (limit,))
     rows = cur.fetchall()
     db.close()
@@ -317,14 +367,18 @@ def baseline(venue_id: str = "default"):
     """, (venue_id,))
     memory_rows = cur.fetchall()
 
-    # Live stats for today
+    # Live stats for today from decoupled tables
     cur.execute("""
         SELECT
-            COUNT(*) as visitors,
-            AVG(wait_seconds) as avg_dwell,
-            ROUND(100.0*SUM(CASE WHEN abandoned=1 THEN 1 ELSE 0 END)/COUNT(*),1) as abandon_rate
-        FROM wait_metrics
-        WHERE wait_seconds > 3 AND date = date('now')
+            COUNT(DISTINCT ts.session_id) as visitors,
+            AVG(ts.duration_seconds) as avg_dwell,
+            ROUND(100.0*COUNT(DISTINCT CASE WHEN be.event_type='abandoned' THEN ts.session_id END)
+                  / MAX(COUNT(DISTINCT ts.session_id), 1), 1) as abandon_rate
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
+          AND date(ts.start_time) = date('now')
     """)
     live = cur.fetchone()
 
@@ -398,16 +452,19 @@ def compare_venues(venue_a: str, venue_b: str):
 
 @app.get("/metrics/hourly")
 def hourly():
+    """Visitor traffic by hour from temporal_sessions (customers only)."""
     db = get_db()
     cur = db.cursor()
     cur.execute("""
         SELECT
-            CAST(strftime('%H', entry_time) AS INTEGER) AS hour,
-            COUNT(*) AS visitors,
-            ROUND(AVG(wait_seconds), 1) AS avg_dwell,
-            SUM(CASE WHEN abandoned=1 THEN 1 ELSE 0 END) AS abandoned
-        FROM wait_metrics
-        WHERE wait_seconds > 3
+            CAST(strftime('%H', ts.start_time) AS INTEGER) AS hour,
+            COUNT(DISTINCT ts.session_id) AS visitors,
+            ROUND(AVG(ts.duration_seconds), 1) AS avg_dwell,
+            COUNT(DISTINCT CASE WHEN be.event_type='abandoned' THEN ts.session_id END) AS abandoned
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
         GROUP BY hour
         ORDER BY hour
     """)
@@ -418,16 +475,19 @@ def hourly():
 
 @app.get("/metrics/business_iq")
 def business_iq():
+    """Composite performance score from business_events + temporal_sessions."""
     db = get_db()
     cur = db.cursor()
     cur.execute("""
         SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN abandoned=0 THEN 1 ELSE 0 END) as served,
-            AVG(wait_seconds) as avg_dwell,
-            MAX(wait_seconds) as max_dwell
-        FROM wait_metrics
-        WHERE wait_seconds > 3
+            COUNT(DISTINCT ts.session_id) as total,
+            COUNT(DISTINCT CASE WHEN be.event_type='served' THEN ts.session_id END) as served,
+            AVG(ts.duration_seconds) as avg_dwell,
+            MAX(ts.duration_seconds) as max_dwell
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
     """)
     r = cur.fetchone()
     db.close()

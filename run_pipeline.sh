@@ -24,11 +24,13 @@ echo "--> 1. Clearing previous database entries..."
 ./venv/bin/python -c "
 import sqlite3
 conn = sqlite3.connect('db/customer_intel.db')
-conn.execute('DELETE FROM wait_metrics')
-conn.execute('DELETE FROM persons')
+conn.execute('DELETE FROM raw_observations')
+conn.execute('DELETE FROM temporal_sessions')
+conn.execute('DELETE FROM staff_resolutions')
+conn.execute('DELETE FROM business_events')
 conn.commit()
 conn.close()
-print('Database tables (persons, wait_metrics) successfully cleared.')
+print('Database tables cleared (raw_observations, temporal_sessions, staff_resolutions, business_events).')
 "
 
 # 2. Update pipeline_position.py video configuration

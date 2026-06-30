@@ -5,7 +5,7 @@ import sqlite3, time
 from datetime import datetime, timezone, timedelta
 
 VIDEOS = ['test_seated6.mp4', 'test_seated3.mkv', 'test_seated4.mkv']
-MODELS = ['yolo11n.pt', 'yolov8m.pt']
+MODELS = ['yolo11n.pt', 'yolov8m.pt', 'yolo_staff_customer.pt']
 VIDEO_START = datetime.now(timezone.utc)
 
 def video_ts_to_iso(ts):

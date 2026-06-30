@@ -26,26 +26,29 @@ def _connect(db_path: str = DB_PATH):
 
 def run_update(venue_id: str = "default", db_path: str = DB_PATH):
     """
-    Called after every pipeline job. Reads fresh wait_metrics data
+    Called after every pipeline job. Reads fresh temporal_sessions + business_events data
     and updates venue_memory with rolling averages.
     """
     db = _connect(db_path)
     cur = db.cursor()
     now = datetime.now(timezone.utc).isoformat()
 
-    # ── 1. Per-hour stats ──────────────────────────────────────────────────────
+    # ── 1. Per-hour stats (customers only) ─────────────────────────────────────
     cur.execute("""
         SELECT
-            CAST(strftime('%H', entry_time) AS INTEGER) AS hour,
-            CAST(strftime('%w', entry_time) AS INTEGER) AS dow,
-            COUNT(*) AS visitor_count,
-            AVG(wait_seconds) AS avg_dwell,
+            CAST(strftime('%H', ts.start_time) AS INTEGER) AS hour,
+            CAST(strftime('%w', ts.start_time) AS INTEGER) AS dow,
+            COUNT(DISTINCT ts.session_id) AS visitor_count,
+            AVG(ts.duration_seconds) AS avg_dwell,
             ROUND(
-                100.0 * SUM(CASE WHEN abandoned=1 THEN 1 ELSE 0 END) / COUNT(*),
+                100.0 * COUNT(DISTINCT CASE WHEN be.event_type='abandoned' THEN ts.session_id END)
+                / MAX(COUNT(DISTINCT ts.session_id), 1),
                 1
             ) AS abandonment_rate
-        FROM wait_metrics
-        WHERE wait_seconds > 3
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
         GROUP BY hour, dow
     """)
     rows = cur.fetchall()
@@ -60,11 +63,15 @@ def run_update(venue_id: str = "default", db_path: str = DB_PATH):
             _upsert_metric(db, cur, venue_id, "abandonment_rate", dow, hour,
                            abandonment_rate, now)
 
-    # ── 2. Global time-to-service ─────────────────────────────────────────────
+    # ── 2. Global time-to-service (from 'served' events) ──────────────────────
     cur.execute("""
-        SELECT AVG(time_to_service)
-        FROM wait_metrics
-        WHERE time_to_service IS NOT NULL AND wait_seconds > 3
+        SELECT AVG(be.value)
+        FROM business_events be
+        JOIN temporal_sessions ts ON be.session_id = ts.session_id
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        WHERE be.event_type = 'served'
+          AND sr.id IS NULL
+          AND ts.duration_seconds > 3
     """)
     row = cur.fetchone()
     if row and row[0] is not None:
@@ -211,20 +218,26 @@ def build_context_snapshot(
 
 def _detect_anomalies(cur, venue_id, dow, hour) -> list:
     """
-    Compares live wait_metrics data against stored baselines.
+    Compares live temporal_sessions data against stored baselines.
     Returns a list of human-readable anomaly strings.
     """
     anomalies = []
 
-    # Live stats for current hour
+    # Live stats for current hour (customers only)
     cur.execute("""
         SELECT
-            COUNT(*) as live_visitors,
-            AVG(wait_seconds) as live_dwell,
-            ROUND(100.0 * SUM(CASE WHEN abandoned=1 THEN 1 ELSE 0 END) / COUNT(*), 1) as live_abandon
-        FROM wait_metrics
-        WHERE wait_seconds > 3
-          AND CAST(strftime('%H', entry_time) AS INTEGER) = ?
+            COUNT(DISTINCT ts.session_id) as live_visitors,
+            AVG(ts.duration_seconds) as live_dwell,
+            ROUND(
+                100.0 * COUNT(DISTINCT CASE WHEN be.event_type='abandoned' THEN ts.session_id END)
+                / MAX(COUNT(DISTINCT ts.session_id), 1),
+                1
+            ) as live_abandon
+        FROM temporal_sessions ts
+        LEFT JOIN staff_resolutions sr ON ts.session_id = sr.session_id
+        LEFT JOIN business_events be ON ts.session_id = be.session_id
+        WHERE sr.id IS NULL AND ts.duration_seconds > 3
+          AND CAST(strftime('%H', ts.start_time) AS INTEGER) = ?
     """, (hour,))
     live = cur.fetchone()
     if not live or live[0] == 0:

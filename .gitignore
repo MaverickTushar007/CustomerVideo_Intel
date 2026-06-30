@@ -65,3 +65,10 @@ yolo_tracking/
 
 # Byte-compiled cache
 *.pyc
+# Exclude large data directories
+roboflow_filtered/
+roboflow_data/
+runs/
+data/
+detection/
+*.zip

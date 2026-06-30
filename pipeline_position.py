@@ -7,7 +7,7 @@ import os
 from restaurant_analytics.staff_identifier import MultiModalStaffIdentifier, UniformColorIdentifier, BadgeDetector
 from datetime import datetime, timezone, timedelta
 
-detector = YOLO('yolo11n.pt')
+detector = YOLO('yolo_staff_customer.pt')
 
 CONF_THRESHOLD = 0.25
 VIDEO_START = datetime.now(timezone.utc)
@@ -28,9 +28,9 @@ db_dir = os.path.join(os.path.dirname(__file__), 'db')
 os.makedirs(db_dir, exist_ok=True)
 db_path = os.path.join(db_dir, 'customer_intel.db')
 DB = sqlite3.connect(db_path, check_same_thread=False)
-# Clear previous data
-DB.execute("DELETE FROM wait_metrics")
-DB.execute("DELETE FROM persons")
+# Clear previous run data from all decoupled tables
+for _tbl in ("business_events", "staff_resolutions", "temporal_sessions", "raw_observations"):
+    DB.execute(f"DELETE FROM {_tbl}")
 DB.commit()
 
 def get_color(token_id):
@@ -40,49 +40,79 @@ def get_color(token_id):
         token_colors[token_id] = tuple(int(x) for x in np.random.randint(80, 255, 3))
     return token_colors[token_id]
 
-def log_person(token, entry_ts, camera_id, is_staff, staff_id):
-    """Log a person entry into the database with explicit staff status.
+# ── DB write helpers (new decoupled schema) ──────────────────────────────────
 
-    Parameters:
-        token (str): Unique identifier for the person.
-        entry_ts (float): Timestamp of entry in video seconds.
-        camera_id (str): Identifier of the camera.
-        is_staff (int): 1 if staff member, 0 otherwise.
-        staff_id (str or None): Identifier for staff member if applicable.
-    """
+def log_session_start(session_id: str, camera_id: str, start_ts: float):
+    """Open a temporal session row for this tracker lifecycle."""
     DB.execute(
-        "INSERT OR IGNORE INTO persons (token_id, first_seen, camera_id, is_staff, staff_id) VALUES (?,?,?,?,?)",
-        (token, video_ts_to_iso(entry_ts), camera_id, is_staff, staff_id)
+        "INSERT OR IGNORE INTO temporal_sessions (session_id, camera_id, start_time) VALUES (?,?,?)",
+        (session_id, camera_id, video_ts_to_iso(start_ts))
     )
     DB.commit()
 
-def log_exit(token, entry_ts, exit_ts, served_tokens, service_times):
-    wait = exit_ts - entry_ts
-    if wait <= 2:
-        return
-    
-    # Check if staff member
-    is_staff_row = DB.execute("SELECT is_staff FROM persons WHERE token_id=?", (token,)).fetchone()
-    is_staff = is_staff_row[0] if is_staff_row else 0
-    
-    date = VIDEO_START.strftime('%Y-%m-%d')
-    abandoned = 0 if token in served_tokens or is_staff else 1
-    
-    # Calculate time to service for customer
-    time_to_service = None
-    if token in service_times and not is_staff:
-        time_to_service = round(service_times[token] - entry_ts, 2)
-        
-    DB.execute(
-        "INSERT INTO wait_metrics (token_id, entry_time, exit_time, wait_seconds, time_to_service, abandoned, date) VALUES (?,?,?,?,?,?,?)",
-        (token, video_ts_to_iso(entry_ts), video_ts_to_iso(exit_ts), round(wait, 2), time_to_service, abandoned, date))
-    DB.execute(
-        "UPDATE persons SET last_seen=?, abandoned=? WHERE token_id=?",
-        (video_ts_to_iso(exit_ts), abandoned, token))
-    DB.commit()
-    print(f"  [DB] {token} exited — dwell: {wait:.1f}s")
 
-VIDEOS = [('test_seated4.mkv', 'cam_test')]
+def log_staff_resolution(
+    session_id: str,
+    staff_id: str | None,
+    confidence: float,
+    method: str
+):
+    """Write a staff identity resolution — only called when confidence >= threshold."""
+    DB.execute(
+        """INSERT INTO staff_resolutions
+               (session_id, staff_id, confidence, resolution_method, resolved_at)
+           VALUES (?,?,?,?,?)""",
+        (session_id, staff_id, round(confidence, 3), method,
+         datetime.now(timezone.utc).isoformat())
+    )
+    DB.commit()
+
+
+def log_session_end(
+    session_id: str,
+    entry_ts: float,
+    exit_ts: float,
+    served_tokens: set,
+    service_times: dict,
+    is_staff: int
+):
+    """Close a temporal session and emit derived business events."""
+    duration = exit_ts - entry_ts
+    if duration <= 2:
+        return
+
+    end_iso = video_ts_to_iso(exit_ts)
+
+    # 1. Close the temporal session
+    DB.execute(
+        "UPDATE temporal_sessions SET end_time=?, duration_seconds=? WHERE session_id=?",
+        (end_iso, round(duration, 2), session_id)
+    )
+
+    # 2. Emit business event — staff sessions get a simple 'staff_shift' marker,
+    #    customer sessions get 'served' or 'abandoned'
+    if is_staff:
+        event_type = "staff_shift"
+        value = round(duration, 2)
+    elif session_id in served_tokens:
+        event_type = "served"
+        value = round(
+            service_times[session_id] - entry_ts, 2
+        ) if session_id in service_times else round(duration, 2)
+    else:
+        event_type = "abandoned"
+        value = round(duration, 2)
+
+    DB.execute(
+        """INSERT INTO business_events
+               (session_id, event_type, timestamp, value)
+           VALUES (?,?,?,?)""",
+        (session_id, event_type, end_iso, value)
+    )
+    DB.commit()
+    print(f"  [DB] {session_id[:8]} exited — {event_type} dwell:{duration:.1f}s")
+
+VIDEOS = [('test_seated3.mkv', 'cam_test')]
 
 # Initialize multimodal staff identifier with multiple uniform color ranges
 # Each covers a common restaurant staff uniform palette
@@ -111,7 +141,7 @@ identifier = MultiModalStaffIdentifier(
 )
 
 # Minimum confidence from the multimodal identifier to classify as staff
-STAFF_CONFIDENCE_THRESHOLD = 0.30
+STAFF_CONFIDENCE_THRESHOLD = 0.40
 
 # Visual constants for bounding box colors
 STAFF_COLOR = (0, 255, 0)      # Green for staff
@@ -129,10 +159,23 @@ for _vid, _cam in VIDEOS:
     served_tokens = set()
     token_is_staff = {}
     service_times = {}
+    token_class_votes = {}
+    resolved_staff_tokens = set()
 
+    writer = None
     for fid, ts, frame in stream_frames(_vid, fps_target=8):
-        results = detector(frame, conf=CONF_THRESHOLD, classes=[0], verbose=False)
-        bboxes = [box.xyxy[0].tolist() for box in results[0].boxes]
+        if writer is None:
+            h, w = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter('output_test_seated3.mp4', fourcc, 8, (w, h))
+        results = detector(frame, conf=CONF_THRESHOLD, verbose=False)
+        bboxes = []
+        box_classes = []
+        box_confidences = []
+        for box in results[0].boxes:
+            bboxes.append(box.xyxy[0].tolist())
+            box_classes.append(int(box.cls[0]))
+            box_confidences.append(float(box.conf[0]))
 
         tracks = tracker.update(bboxes, fid, ts)
 
@@ -140,23 +183,35 @@ for _vid, _cam in VIDEOS:
         centroids = {}  # token -> (cx, cy)
         staff_centroids = {}  # token -> (cx, cy) for staff only
 
-        for token, bbox, is_new in tracks:
+        for i, (token, bbox, is_new) in enumerate(tracks):
             cx = (bbox[0]+bbox[2])/2
             cy = (bbox[1]+bbox[3])/2
             centroids[token] = (cx, cy)
 
-            # Determine staff status (cache per token)
-            if token not in token_is_staff:
-                label, confidence = identifier.identify_staff(frame, bbox)
-                is_staff = 1 if (label is not None and confidence >= STAFF_CONFIDENCE_THRESHOLD) else 0
-                staff_id = f"emp_{token[:4]}" if is_staff else None
-                token_is_staff[token] = is_staff
-                # Log person entry with staff flag
-                log_person(token, ts, _cam, is_staff, staff_id)
-                conf_str = f" conf={confidence:.2f}" if label else ""
-                print(f"[{ts:.1f}s] NEW person: {token} ({'STAFF' if is_staff else 'customer'}{conf_str})")
-            else:
-                is_staff = token_is_staff[token]
+            cls = box_classes[i]
+            conf = box_confidences[i]
+
+            # Update votes and dynamic role cache
+            token_class_votes.setdefault(token, []).append(cls)
+            votes = token_class_votes[token]
+            is_staff = 1 if (votes.count(1) > votes.count(0)) else 0
+            token_is_staff[token] = is_staff
+
+            if is_new:
+                log_session_start(token, _cam, ts)
+                print(f"[{ts:.1f}s] NEW person: {token}")
+
+            # If classification settles as staff, write resolution record
+            if is_staff and token not in resolved_staff_tokens:
+                resolved_staff_tokens.add(token)
+                staff_id = f"staff_{token[:4]}"
+                log_staff_resolution(
+                    session_id=token,
+                    staff_id=staff_id,
+                    confidence=conf,
+                    method="yolo_custom"
+                )
+                print(f"[{ts:.1f}s] Resolved {token} as STAFF (conf={conf:.2f})")
 
             if is_staff:
                 staff_centroids[token] = (cx, cy)
@@ -201,7 +256,8 @@ for _vid, _cam in VIDEOS:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
 
         for token, entry_ts, exit_ts in tracker.get_exited(fid):
-            log_exit(token, entry_ts, exit_ts, served_tokens, service_times)
+            log_session_end(token, entry_ts, exit_ts, served_tokens, service_times,
+                            is_staff=token_is_staff.get(token, 0))
 
         # Draw service zone
         cv2.rectangle(frame, (360,180), (482,360), (0,165,255), 2)
@@ -212,6 +268,9 @@ for _vid, _cam in VIDEOS:
         n_cust = len(token_is_staff) - n_staff
         cv2.putText(frame, f"Tracked: {len(tracker.tracks)} | Staff: {n_staff} | Cust: {n_cust} | t={ts:.1f}s",
                     (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
+        if writer is not None:
+            writer.write(frame)
+
         try:
             cv2.imshow('Position Tracker', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -219,11 +278,12 @@ for _vid, _cam in VIDEOS:
         except Exception:
             pass
 
+    if writer is not None:
+        writer.release()
+
     for token, entry_ts, exit_ts in tracker.flush_all():
-        log_exit(token, entry_ts, exit_ts, served_tokens, service_times)
-        DB.execute(
-            "UPDATE persons SET last_seen=? WHERE token_id=? AND last_seen IS NULL",
-            (video_ts_to_iso(exit_ts), token))
+        log_session_end(token, entry_ts, exit_ts, served_tokens, service_times,
+                        is_staff=token_is_staff.get(token, 0))
     DB.commit()
     print(f"--- Done {_cam} ---")
 
