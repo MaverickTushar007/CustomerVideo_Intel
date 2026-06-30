@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+// Premium Customer Intelligence Dashboard - V1.1
 import axios from "axios";
 
 const API = process.env.REACT_APP_API_URL || "http://localhost:8000";
