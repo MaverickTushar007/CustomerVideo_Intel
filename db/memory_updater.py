@@ -10,11 +10,12 @@ Self-learning memory engine. Runs after every pipeline job and:
      learned baselines into LLM prompts.
 """
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
-DB_PATH = "db/customer_intel.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "customer_intel.db")
 ALPHA = 0.3  # EMA weight for new observations (0=never learn, 1=forget everything)
 
 

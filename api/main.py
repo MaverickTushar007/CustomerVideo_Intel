@@ -15,11 +15,17 @@ except ImportError:
 
 # Ensure DB exists on startup (Railway ephemeral filesystem)
 import os
-os.makedirs("db", exist_ok=True)
-os.makedirs("uploads", exist_ok=True)
+
+# Build absolute paths so the app works regardless of working directory
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_DIR = os.path.join(BASE_DIR, "db")
+DB_PATH = os.path.join(DB_DIR, "customer_intel.db")
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(DB_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 import sqlite3 as _sqlite3
-_conn = _sqlite3.connect("db/customer_intel.db")
+_conn = _sqlite3.connect(DB_PATH)
 _conn.executescript("""
 PRAGMA foreign_keys = ON;
 
@@ -96,7 +102,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 def get_db():
-    return sqlite3.connect('db/customer_intel.db')
+    return sqlite3.connect(DB_PATH)
 
 SCHEMA = """
 Tables:
@@ -316,8 +322,7 @@ def rate_answer(answer_id: str, body: RatingBody):
         return {"error": "answer_id not found"}
     return {"status": "ok", "answer_id": answer_id, "rating": body.rating}
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# UPLOAD_DIR already defined at module top
 
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):

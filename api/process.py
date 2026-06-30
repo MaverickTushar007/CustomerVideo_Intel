@@ -5,6 +5,10 @@ from datetime import datetime, timezone, timedelta
 from ultralytics import YOLO
 from tracking.position_tracker import PositionTracker
 
+# Absolute paths — works on Railway regardless of working directory
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "db", "customer_intel.db")
+
 jobs = {}
 
 detector = None
@@ -36,7 +40,7 @@ def process_video(job_id, video_path, venue_id="default"):
         skip = max(1, int(native_fps / 8))
         frame_id = 0
 
-        DB = sqlite3.connect('db/customer_intel.db')
+        DB = sqlite3.connect(DB_PATH)
         # Using new schema without truncating tables
 
         token_entry = {}
